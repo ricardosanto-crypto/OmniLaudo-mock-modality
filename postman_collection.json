@@ -1,0 +1,107 @@
+{
+  "info": {
+    "_postman_id": "omnilaudo-mock-modality",
+    "name": "OmniLaudo Mock Modality",
+    "description": "Testes da API para simular máquina de ultrassom/modalidade",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8081/api/v1/exams/health",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8081",
+          "path": ["api", "v1", "exams", "health"]
+        }
+      }
+    },
+    {
+      "name": "API Info",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8081/api/v1/exams/info",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8081",
+          "path": ["api", "v1", "exams", "info"]
+        }
+      }
+    },
+    {
+      "name": "Simular Exame - Ultrassom Abdomen",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"accession_number\": \"ACC-20240410-001\",\n  \"patient_id\": 1,\n  \"patient_name\": \"João Silva\",\n  \"exam_type\": \"ULTRASSOM ABDOMEN\",\n  \"modality\": \"US\",\n  \"description\": \"Ultrassom abdominal para investigação de dor\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8081/api/v1/exams/simulate",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8081",
+          "path": ["api", "v1", "exams", "simulate"]
+        }
+      }
+    },
+    {
+      "name": "Simular Exame - Ultrassom Obstétrico",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"accession_number\": \"ACC-OB-20240410-001\",\n  \"patient_id\": 2,\n  \"patient_name\": \"Maria Santos\",\n  \"exam_type\": \"ULTRASSOM OBSTETRICIA\",\n  \"modality\": \"US\",\n  \"description\": \"Ultrassom obstétrico - 1º trimestre\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8081/api/v1/exams/simulate",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8081",
+          "path": ["api", "v1", "exams", "simulate"]
+        }
+      }
+    },
+    {
+      "name": "Simular Exame - Raio-X Tórax",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"accession_number\": \"ACC-RX-20240410-001\",\n  \"patient_id\": 3,\n  \"patient_name\": \"Pedro Costa\",\n  \"exam_type\": \"RAIO-X TORAX\",\n  \"modality\": \"CR\",\n  \"description\": \"Radiografia de tórax em PA e perfil\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8081/api/v1/exams/simulate",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8081",
+          "path": ["api", "v1", "exams", "simulate"]
+        }
+      }
+    }
+  ]
+}
