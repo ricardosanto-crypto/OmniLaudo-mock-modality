@@ -15,6 +15,7 @@ import org.dcm4che3.net.*;
 import org.dcm4che3.net.pdu.AAssociateRQ;
 import org.dcm4che3.net.pdu.PresentationContext;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import java.io.ByteArrayInputStream;
@@ -76,51 +77,72 @@ public class DicomGeneratorService {
     @Value("${modality.orthanc.aet:ORTHANC}")
     private String orthancAET;
 
+    @Value("${modality.ris.url:http://localhost:3001/api/v1/dicom/worklist}")
+    private String risUrl;
+
+    @Value("${modality.ris.token:}")
+    private String risToken;
+
     /**
      * Simula um equipamento de modalidade: consulta worklist, gera 3 DICOMs e envia via C-STORE
+     * Se o worklist falhar, usa dados mockados como fallback
      */
     public List<DicomSendResponse> simulateModality() {
         List<DicomSendResponse> responses = new ArrayList<>();
         try {
             log.info("🔍 Iniciando simulação de modalidade: consultando worklist...");
 
-            // 1. C-FIND worklist
-            List<Attributes> worklistItems = queryWorklist();
-            log.info("📋 Worklist retornou {} itens", worklistItems.size());
+            // 1. C-FIND worklist - com tratamento de erro
+            List<Attributes> worklistItems;
+            try {
+                //worklistItems = queryWorklist();
+                worklistItems = queryWorklistFromRis();
+                log.info("📋 Worklist retornou {} itens", worklistItems.size());
+            } catch (Exception worklistError) {
+                log.warn("⚠️ Falha ao consultar worklist DICOM: {}. Usando dados mockados como fallback.", 
+                         worklistError.getMessage());
+                worklistItems = generateMockWorklistData();
+                log.info("📋 Usando {} itens mockados", worklistItems.size());
+            }
 
-            for (Attributes worklistItem : worklistItems) {
-                try {
-                    // Extrair dados do worklist
-                    String accessionNumber = worklistItem.getString(Tag.AccessionNumber);
-                    String patientName = worklistItem.getString(Tag.PatientName);
-                    String patientID = worklistItem.getString(Tag.PatientID);
-                    String studyInstanceUID = worklistItem.getString(Tag.StudyInstanceUID);
-                    String modality = worklistItem.getString(Tag.Modality) != null ? worklistItem.getString(Tag.Modality) : "US";
+            if (worklistItems.isEmpty()) {
+                log.warn("⚠️ Nenhum exame encontrado. Gerando exame mockado para teste.");
+                //worklistItems = generateMockWorklistData();
+            }else{
+                for (Attributes worklistItem : worklistItems) {
+                    try {
+                        // Extrair dados do worklist
+                        String accessionNumber = worklistItem.getString(Tag.AccessionNumber);
+                        String patientName = worklistItem.getString(Tag.PatientName);
+                        String patientID = worklistItem.getString(Tag.PatientID);
+                        String studyInstanceUID = worklistItem.getString(Tag.StudyInstanceUID);
+                        String modality = worklistItem.getString(Tag.Modality) != null ? worklistItem.getString(Tag.Modality) : "US";
 
-                    log.info("🎬 Processando exame: Accession={}, Paciente={}", accessionNumber, patientName);
+                        log.info("🎬 Processando exame: Accession={}, Paciente={}, Modality={}", accessionNumber, patientName, modality);
 
-                    // 2. Gerar 3 DICOMs para este exame
-                    List<byte[]> dicomImages = generateExamImages(accessionNumber, patientName, patientID, studyInstanceUID, modality);
+                        // 2. Gerar 3 DICOMs para este exame
+                        List<byte[]> dicomImages = generateExamImages(accessionNumber, patientName, patientID, studyInstanceUID, modality);
 
-                    // 3. Enviar cada imagem via C-STORE
-                    for (int i = 0; i < dicomImages.size(); i++) {
-                        DicomSendResponse response = sendDicomViaCStore(dicomImages.get(i), accessionNumber + "_img" + (i+1));
-                        responses.add(response);
+                        // 3. Enviar cada imagem via C-STORE ou REST (fallback)
+                        for (int i = 0; i < dicomImages.size(); i++) {
+                            DicomSendResponse response = sendDicomViaCStoreWithFallback(dicomImages.get(i), accessionNumber + "_img" + (i+1));
+                            responses.add(response);
+                        }
+
+                    } catch (Exception e) {
+                        log.error("❌ Erro ao processar item do worklist: {}", e.getMessage());
+                        responses.add(DicomSendResponse.builder()
+                                .success(false)
+                                .status("ERROR")
+                                .message("Error processing worklist item: " + e.getMessage())
+                                .timestamp(System.currentTimeMillis())
+                                .build());
                     }
-
-                } catch (Exception e) {
-                    log.error("❌ Erro ao processar item do worklist: {}", e.getMessage());
-                    responses.add(DicomSendResponse.builder()
-                            .success(false)
-                            .status("ERROR")
-                            .message("Error processing worklist item: " + e.getMessage())
-                            .timestamp(System.currentTimeMillis())
-                            .build());
                 }
             }
 
         } catch (Exception e) {
-            log.error("❌ Erro na simulação de modalidade: {}", e.getMessage());
+            log.error("❌ Erro na simulação de modalidade: {}", e.getMessage(), e);
             responses.add(DicomSendResponse.builder()
                     .success(false)
                     .status("ERROR")
@@ -131,17 +153,37 @@ public class DicomGeneratorService {
 
         return responses;
     }
-    private List<Attributes> queryWorklist() throws Exception {
+
+    /**
+     * Gera dados mockados para teste quando worklist não está disponível
+     */
+    private List<Attributes> generateMockWorklistData() {
+        List<Attributes> mockItems = new ArrayList<>();
+
+        // Gerar 2 exames mockados
+        for (int j = 1; j <= 2; j++) {
+            Attributes mockItem = new Attributes();
+            mockItem.setString(Tag.AccessionNumber, VR.SH, "MOCK-ACC-" + System.currentTimeMillis() + "-" + j);
+            mockItem.setString(Tag.PatientName, VR.PN, "Paciente Mock " + j);
+            mockItem.setString(Tag.PatientID, VR.LO, String.valueOf(1000 + j));
+            mockItem.setString(Tag.StudyInstanceUID, VR.UI, generateUID());
+            mockItem.setString(Tag.Modality, VR.CS, j % 2 == 0 ? "MR" : "US");
+            mockItems.add(mockItem);
+        }
+
+        return mockItems;
+    }
+    /*private List<Attributes> queryWorklist() throws Exception {
         List<Attributes> results = new ArrayList<>();
 
-        ApplicationEntity ae = new ApplicationEntity(modalityAET);
+        Device device = new Device("mock-modality");
         Connection conn = new Connection();
         conn.setHostname(dicomHost);
         conn.setPort(dicomPort);
-        ae.addConnection(conn);
-
-        Device device = new Device("mock-modality");
         device.addConnection(conn);
+
+        ApplicationEntity ae = new ApplicationEntity(modalityAET);
+        ae.addConnection(conn);
         device.addApplicationEntity(ae);
 
         AAssociateRQ rq = new AAssociateRQ();
@@ -149,7 +191,7 @@ public class DicomGeneratorService {
         rq.setCalledAET(orthancAET);
         rq.addPresentationContext(new PresentationContext(1, UID.ModalityWorklistInformationModelFind, UID.ImplicitVRLittleEndian));
 
-        Association as = ae.connect(conn, null, rq);
+        Association as = ae.connect(device, conn, rq);
         try {
             // Criar query dataset
             Attributes query = new Attributes();
@@ -170,7 +212,90 @@ public class DicomGeneratorService {
         }
 
         return results;
+    }*/
+
+private List<Attributes> queryWorklistFromRis() {
+    List<Attributes> results = new ArrayList<>();
+    
+    try {
+        log.info("🔍 Consultando worklist do RIS: {}", risUrl);
+        
+        var request = webClientBuilder.build()
+            .get()
+            .uri(risUrl);
+        
+        if (risToken != null && !risToken.isEmpty()) {
+            request = request.headers(headers -> headers.setBearerAuth(risToken));
+        }
+        
+        Map<String, Object> response = request
+            .retrieve()
+            .bodyToMono(new ParameterizedTypeReference<Map<String, Object>>() {})
+            .block();
+        
+        if (response == null || !response.containsKey("data")) {
+            log.warn("⚠️ Resposta inválida do RIS");
+            return results;
+        }
+        
+        Object data = response.get("data");
+        if (!(data instanceof List)) {
+            log.warn("⚠️ Formato de dados inválido do RIS");
+            return results;
+        }
+        
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> risWorklist = (List<Map<String, Object>>) data;
+        
+        if (risWorklist.isEmpty()) {
+            log.warn("⚠️ Worklist vazio do RIS");
+            return results;
+        }
+        
+        log.info("📋 RIS retornou {} itens", risWorklist.size());
+        
+        for (Map<String, Object> item : risWorklist) {
+            Attributes attrs = new Attributes();
+            
+            String accessionNumber = (String) item.get("accessionNumber");
+            String patientName = (String) item.get("patientName");
+            Object patientIdObj = item.get("patientId");
+            String patientId = patientIdObj != null ? patientIdObj.toString() : null;
+            String modality = (String) item.get("modality");
+            String studyDescription = (String) item.getOrDefault("studyDescription", (String) item.get("procedureDescription"));
+            
+            if (accessionNumber != null) {
+                attrs.setString(Tag.AccessionNumber, VR.SH, accessionNumber);
+            }
+            if (patientName != null) {
+                attrs.setString(Tag.PatientName, VR.PN, patientName);
+            }
+            if (patientId != null) {
+                attrs.setString(Tag.PatientID, VR.LO, patientId);
+            }
+            if (modality != null) {
+                attrs.setString(Tag.Modality, VR.CS, modality);
+            } else {
+                attrs.setString(Tag.Modality, VR.CS, "US");
+            }
+            if (studyDescription != null) {
+                attrs.setString(Tag.StudyDescription, VR.LO, studyDescription);
+            }
+            
+            attrs.setString(Tag.QueryRetrieveLevel, VR.CS, "STUDY");
+            attrs.setString(Tag.StudyInstanceUID, VR.UI, generateUID());
+            
+            results.add(attrs);
+            log.debug("✅ Item convertido: Accession={}, Paciente={}", accessionNumber, patientName);
+        }
+        
+    } catch (Exception e) {
+        log.error("❌ Erro ao consultar worklist do RIS: {}", e.getMessage());
     }
+    
+    return results;
+}
+
     private List<byte[]> generateExamImages(String accessionNumber, String patientName, String patientID, String studyInstanceUID, String modality) throws Exception {
         List<byte[]> images = new ArrayList<>();
 
@@ -237,14 +362,16 @@ public class DicomGeneratorService {
     }
     private DicomSendResponse sendDicomViaCStore(byte[] dicomData, String identifier) {
         try {
-            ApplicationEntity ae = new ApplicationEntity(modalityAET);
+            log.info("🔌 Tentando C-STORE para {}:{}", dicomHost, dicomPort);
+            
+            Device device = new Device("mock-modality");
             Connection conn = new Connection();
             conn.setHostname(dicomHost);
             conn.setPort(dicomPort);
-            ae.addConnection(conn);
-
-            Device device = new Device("mock-modality");
             device.addConnection(conn);
+
+            ApplicationEntity ae = new ApplicationEntity(modalityAET);
+            ae.addConnection(conn);
             device.addApplicationEntity(ae);
 
             AAssociateRQ rq = new AAssociateRQ();
@@ -253,7 +380,7 @@ public class DicomGeneratorService {
             rq.addPresentationContext(new PresentationContext(1, UID.UltrasoundImageStorage, UID.ImplicitVRLittleEndian));
             rq.addPresentationContext(new PresentationContext(3, UID.MRImageStorage, UID.ImplicitVRLittleEndian));
 
-            Association as = ae.connect(conn, null, rq);
+            Association as = ae.connect(conn, rq);
             try {
                 Attributes fmi;
                 Attributes dataset;
@@ -289,6 +416,62 @@ public class DicomGeneratorService {
                     .success(false)
                     .status("ERROR")
                     .message("Error sending DICOM via C-STORE: " + e.getMessage())
+                    .accessionNumber(identifier)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    /**
+     * Tenta enviar via C-STORE, se falhar faz fallback para REST API (Orthanc)
+     */
+    private DicomSendResponse sendDicomViaCStoreWithFallback(byte[] dicomData, String identifier) {
+        try {
+            // Tenta C-STORE primeiro
+            log.debug("Tentando enviar DICOM via C-STORE: {}", identifier);
+            DicomSendResponse cstoreResponse = sendDicomViaCStore(dicomData, identifier);
+            if (cstoreResponse.isSuccess()) {
+                return cstoreResponse;
+            }
+            
+            // Se C-STORE falhar, tenta REST
+            log.warn("C-STORE falhou ({}), tentando via REST API...", cstoreResponse.getMessage());
+            return sendToOrthancRest(dicomData, identifier);
+            
+        } catch (Exception e) {
+            log.error("❌ Erro ao enviar DICOM com fallback: {}", e.getMessage());
+            return DicomSendResponse.builder()
+                    .success(false)
+                    .status("ERROR")
+                    .message("Error sending DICOM: " + e.getMessage())
+                    .accessionNumber(identifier)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+        }
+    }
+
+    /**
+     * Envia DICOM para Orthanc via REST API
+     */
+    private DicomSendResponse sendToOrthancRest(byte[] dicomData, String identifier) {
+        try {
+            log.info("📤 Enviando DICOM via REST para Orthanc: {}", identifier);
+            String orthancStudyId = sendToOrthanc(dicomData, identifier);
+            
+            return DicomSendResponse.builder()
+                    .success(true)
+                    .status("SUCCESS")
+                    .message("DICOM sent via REST API successfully")
+                    .accessionNumber(identifier)
+                    .orthancStudyId(orthancStudyId)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+        } catch (Exception e) {
+            log.error("❌ Erro ao enviar DICOM via REST: {}", e.getMessage());
+            return DicomSendResponse.builder()
+                    .success(false)
+                    .status("ERROR")
+                    .message("Error sending DICOM via REST: " + e.getMessage())
                     .accessionNumber(identifier)
                     .timestamp(System.currentTimeMillis())
                     .build();
@@ -577,11 +760,16 @@ public class DicomGeneratorService {
             String instanceId = (String) response.get("ID");
             log.debug("✅ Instance criada no Orthanc com ID: {}", instanceId);
 
-            // Busca informações do estudo
+            String parentStudy = (String) response.get("ParentStudy");
+            if (parentStudy != null) {
+                log.debug("✅ ParentStudy obtido: {}", parentStudy);
+                return parentStudy;
+            }
+
+            log.warn("⚠️ ParentStudy não encontrado na resposta, buscando via API...");
             var studyRequestSpec = webClient.get()
                     .uri(orthancUrl + "/instances/" + instanceId);
 
-            // Adiciona autenticação se credenciais estiverem configuradas
             if (orthancUsername != null && !orthancUsername.isEmpty() &&
                 orthancPassword != null && !orthancPassword.isEmpty()) {
                 studyRequestSpec = studyRequestSpec.headers(headers -> headers.setBasicAuth(orthancUsername, orthancPassword));
