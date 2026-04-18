@@ -3,8 +3,8 @@ package com.omnilaudo.mockmodality.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.omnilaudo.mockmodality.dto.DicomSendResponse;
 import com.omnilaudo.mockmodality.dto.ExamSimulationRequest;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.dcm4che3.data.Attributes;
 import org.dcm4che3.data.Tag;
 import org.dcm4che3.data.UID;
@@ -25,14 +25,20 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class DicomGeneratorService {
 
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper objectMapper;
+
+    @Autowired
+    public DicomGeneratorService(WebClient.Builder webClientBuilder, ObjectMapper objectMapper) {
+        this.webClientBuilder = webClientBuilder;
+        this.objectMapper = objectMapper;
+    }
 
     /**
      * Classe para armazenar DICOM temporariamente
@@ -90,54 +96,75 @@ public class DicomGeneratorService {
     public List<DicomSendResponse> simulateModality() {
         List<DicomSendResponse> responses = new ArrayList<>();
         try {
+            log.info("🎬 ===== CONFIGURACAO DICOM =====");
+            log.info("🎬 DICOM Host: {}:{}", dicomHost, dicomPort);
+            log.info("🎬 AET: {} -> {}", modalityAET, orthancAET);
+            log.info("🎬 Orthanc URL: {}", orthancUrl);
+            log.info("🎬 RIS URL: {}", risUrl);
+            log.info("🎬 ==============================");
             log.info("🔍 Iniciando simulação de modalidade: consultando worklist...");
 
-            // 1. C-FIND worklist - com tratamento de erro
+            // 1. Tentar worklist DICOM primeiro, depois RIS, depois fallback mockado
             List<Attributes> worklistItems;
+            Exception firstError = null;
+
+            // Tentativa 1: C-FIND DICOM via Orthanc
             try {
-                //worklistItems = queryWorklist();
-                worklistItems = queryWorklistFromRis();
-                log.info("📋 Worklist retornou {} itens", worklistItems.size());
-            } catch (Exception worklistError) {
-                log.warn("⚠️ Falha ao consultar worklist DICOM: {}. Usando dados mockados como fallback.", 
-                         worklistError.getMessage());
+                worklistItems = queryWorklist();
+                log.info("📋 Worklist DICOM retornou {} itens", worklistItems.size());
+            } catch (Exception e) {
+                log.warn("⚠️ Falha no worklist DICOM: {}. Tentando RIS...", e.getMessage());
+                firstError = e;
+                worklistItems = null;
+            }
+
+            // Tentativa 2: RIS API
+            if (worklistItems == null || worklistItems.isEmpty()) {
+                try {
+                    worklistItems = queryWorklistFromRis();
+                    if (worklistItems != null && !worklistItems.isEmpty()) {
+                        log.info("📋 RIS retornou {} itens", worklistItems.size());
+                    }
+                } catch (Exception e) {
+                    log.warn("⚠️ Falha ao consultar RIS: {}.", e.getMessage());
+                }
+            }
+
+            // Fallback: dados mockados
+            if (worklistItems == null || worklistItems.isEmpty()) {
+                log.warn("⚠️ Nenhuma fonte de worklist disponível. Usando dados mockados como fallback.");
                 worklistItems = generateMockWorklistData();
                 log.info("📋 Usando {} itens mockados", worklistItems.size());
             }
 
-            if (worklistItems.isEmpty()) {
-                log.warn("⚠️ Nenhum exame encontrado. Gerando exame mockado para teste.");
-                //worklistItems = generateMockWorklistData();
-            }else{
-                for (Attributes worklistItem : worklistItems) {
-                    try {
-                        // Extrair dados do worklist
-                        String accessionNumber = worklistItem.getString(Tag.AccessionNumber);
-                        String patientName = worklistItem.getString(Tag.PatientName);
-                        String patientID = worklistItem.getString(Tag.PatientID);
-                        String studyInstanceUID = worklistItem.getString(Tag.StudyInstanceUID);
-                        String modality = worklistItem.getString(Tag.Modality) != null ? worklistItem.getString(Tag.Modality) : "US";
+            for (Attributes worklistItem : worklistItems) {
+                try {
+                    // Extrair dados do worklist
+                    String accessionNumber = worklistItem.getString(Tag.AccessionNumber);
+                    String patientName = worklistItem.getString(Tag.PatientName);
+                    String patientID = worklistItem.getString(Tag.PatientID);
+                    String studyInstanceUID = worklistItem.getString(Tag.StudyInstanceUID);
+                    String modality = worklistItem.getString(Tag.Modality) != null ? worklistItem.getString(Tag.Modality) : "US";
 
-                        log.info("🎬 Processando exame: Accession={}, Paciente={}, Modality={}", accessionNumber, patientName, modality);
+                    log.info("🎬 Processando exame: Accession={}, Paciente={}, Modality={}", accessionNumber, patientName, modality);
 
-                        // 2. Gerar 3 DICOMs para este exame
-                        List<byte[]> dicomImages = generateExamImages(accessionNumber, patientName, patientID, studyInstanceUID, modality);
+                    // 2. Gerar 3 DICOMs para este exame
+                    List<byte[]> dicomImages = generateExamImages(accessionNumber, patientName, patientID, studyInstanceUID, modality);
 
-                        // 3. Enviar cada imagem via C-STORE ou REST (fallback)
-                        for (int i = 0; i < dicomImages.size(); i++) {
-                            DicomSendResponse response = sendDicomViaCStoreWithFallback(dicomImages.get(i), accessionNumber + "_img" + (i+1));
-                            responses.add(response);
-                        }
-
-                    } catch (Exception e) {
-                        log.error("❌ Erro ao processar item do worklist: {}", e.getMessage());
-                        responses.add(DicomSendResponse.builder()
-                                .success(false)
-                                .status("ERROR")
-                                .message("Error processing worklist item: " + e.getMessage())
-                                .timestamp(System.currentTimeMillis())
-                                .build());
+                    // 3. Enviar cada imagem via C-STORE ou REST (fallback)
+                    for (int i = 0; i < dicomImages.size(); i++) {
+                        DicomSendResponse response = sendDicomViaCStoreWithFallback(dicomImages.get(i), accessionNumber + "_img" + (i+1));
+                        responses.add(response);
                     }
+
+                } catch (Exception e) {
+                    log.error("❌ Erro ao processar item do worklist: {}", e.getMessage());
+                    responses.add(DicomSendResponse.builder()
+                            .success(false)
+                            .status("ERROR")
+                            .message("Error processing worklist item: " + e.getMessage())
+                            .timestamp(System.currentTimeMillis())
+                            .build());
                 }
             }
 
@@ -173,10 +200,14 @@ public class DicomGeneratorService {
 
         return mockItems;
     }
-    /*private List<Attributes> queryWorklist() throws Exception {
+
+    private List<Attributes> queryWorklist() throws Exception {
         List<Attributes> results = new ArrayList<>();
 
         Device device = new Device("mock-modality");
+        device.setExecutor(Executors.newCachedThreadPool());
+        device.setScheduledExecutor(Executors.newSingleThreadScheduledExecutor());
+
         Connection conn = new Connection();
         conn.setHostname(dicomHost);
         conn.setPort(dicomPort);
@@ -189,30 +220,46 @@ public class DicomGeneratorService {
         AAssociateRQ rq = new AAssociateRQ();
         rq.setCallingAET(modalityAET);
         rq.setCalledAET(orthancAET);
-        rq.addPresentationContext(new PresentationContext(1, UID.ModalityWorklistInformationModelFind, UID.ImplicitVRLittleEndian));
+        rq.addPresentationContext(
+                new PresentationContext(1, UID.ModalityWorklistInformationModelFind, UID.ExplicitVRLittleEndian));
+        rq.addPresentationContext(
+                new PresentationContext(3, UID.ModalityWorklistInformationModelFind, UID.ImplicitVRLittleEndian));
 
-        Association as = ae.connect(device, conn, rq);
+        Association as = ae.connect(conn, rq);
         try {
-            // Criar query dataset
             Attributes query = new Attributes();
-            query.setString(Tag.QueryRetrieveLevel, VR.CS, "STUDY");
-            // Adicionar filtros se necessário, por exemplo:
-            // query.setString(Tag.AccessionNumber, VR.SH, "*");
-            // query.setString(Tag.PatientName, VR.PN, "*");
+            query.setString(Tag.QueryRetrieveLevel, VR.CS, "WORKLIST");
 
-            DimseRSP rsp = as.cfind(UID.ModalityWorklistInformationModelFind, 1, query, null, 0);
-            while (rsp.next()) {
-                Attributes dataset = rsp.getDataset();
-                if (dataset != null) {
-                    results.add(dataset);
+            try {
+                DimseRSP rsp = as.cfind(UID.ModalityWorklistInformationModelFind, 1, query, null, 0);
+                Attributes command = rsp.getCommand();
+
+                while (rsp.next()) {
+                    Attributes dataset = rsp.getDataset();
+                    log.debug("C-FIND next called: datasetPresent={}", dataset != null);
+                    if (dataset != null) {
+                        results.add(dataset);
+                    }
                 }
+
+                int status = -1;
+                if (command != null) {
+                    status = command.getInt(Tag.Status, -1);
+                } else {
+                    log.warn("⚠️ C-FIND command é null - possivelmente abortado pelo servidor");
+                }
+                log.debug("C-FIND command status = {}", status);
+
+            } catch (Exception e) {
+                log.error("❌ Erro no C-FIND MWL: {}", e.getMessage(), e);
+                throw e;
             }
         } finally {
             as.release();
         }
 
         return results;
-    }*/
+    }
 
 private List<Attributes> queryWorklistFromRis() {
     List<Attributes> results = new ArrayList<>();
