@@ -21,11 +21,17 @@ import org.springframework.web.reactive.function.client.WebClient;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Service
 @Slf4j
@@ -88,6 +94,9 @@ public class DicomGeneratorService {
 
     @Value("${modality.ris.token:}")
     private String risToken;
+
+    @Value("${modality.templates.path:/app/templates}")
+    private String templatesPath;
 
     /**
      * Simula um equipamento de modalidade: consulta worklist, gera 3 DICOMs e envia via C-STORE
@@ -345,67 +354,125 @@ private List<Attributes> queryWorklistFromRis() {
 
     private List<byte[]> generateExamImages(String accessionNumber, String patientName, String patientID, String studyInstanceUID, String modality) throws Exception {
         List<byte[]> images = new ArrayList<>();
+        
+        File templateFile = pickRandomTemplateFile();
 
         for (int i = 1; i <= 3; i++) {
-            Attributes dcmAttrs = new Attributes();
-
-            // Meta information
-            dcmAttrs.setString(Tag.PatientName, VR.PN, patientName);
-            dcmAttrs.setString(Tag.PatientID, VR.LO, patientID);
-            dcmAttrs.setString(Tag.AccessionNumber, VR.SH, accessionNumber);
-
-            // Study Information
-            dcmAttrs.setString(Tag.StudyInstanceUID, VR.UI, studyInstanceUID);
-            String seriesUID = generateUID();
-            String instanceUID = generateUID();
-
-            dcmAttrs.setString(Tag.SeriesInstanceUID, VR.UI, seriesUID);
-            dcmAttrs.setString(Tag.SOPInstanceUID, VR.UI, instanceUID);
-            dcmAttrs.setString(Tag.SOPClassUID, VR.UI, modality.equals("MR") ? UID.MRImageStorage : UID.UltrasoundImageStorage);
-
-            // Date and Time
-            String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
-            String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
-            dcmAttrs.setString(Tag.StudyDate, VR.DA, now);
-            dcmAttrs.setString(Tag.StudyTime, VR.TM, nowTime);
-            dcmAttrs.setString(Tag.ContentDate, VR.DA, now);
-            dcmAttrs.setString(Tag.ContentTime, VR.TM, nowTime);
-
-            // Modality
-            dcmAttrs.setString(Tag.Modality, VR.CS, modality);
-
-            // Series Number
-            dcmAttrs.setInt(Tag.SeriesNumber, VR.IS, 1);
-            dcmAttrs.setInt(Tag.InstanceNumber, VR.IS, i);
-
-            // Manufacturer and Device Info
-            dcmAttrs.setString(Tag.Manufacturer, VR.LO, "OmniLaudo Mock Modality");
-            dcmAttrs.setString(Tag.ManufacturerModelName, VR.LO, modality.equals("MR") ? "MockMR-Simulator-v1.0" : "MockUS-Simulator-v1.0");
-            dcmAttrs.setString(Tag.StationName, VR.SH, "MockModality-01");
-
-            // Image dimensions
-            dcmAttrs.setInt(Tag.SamplesPerPixel, VR.US, 1);
-            dcmAttrs.setInt(Tag.Rows, VR.US, 512);
-            dcmAttrs.setInt(Tag.Columns, VR.US, 512);
-            dcmAttrs.setInt(Tag.BitsAllocated, VR.US, 8);
-            dcmAttrs.setInt(Tag.BitsStored, VR.US, 8);
-            dcmAttrs.setInt(Tag.HighBit, VR.US, 7);
-            dcmAttrs.setString(Tag.PixelRepresentation, VR.US, "0");
-            dcmAttrs.setString(Tag.PhotometricInterpretation, VR.CS, "MONOCHROME2");
-
-            // Pixel data
-            byte[] pixelData = generateMockPixelData(512, 512, i);
-            dcmAttrs.setBytes(Tag.PixelData, VR.OB, pixelData);
-
-            // Serialize
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (DicomOutputStream dos = new DicomOutputStream(baos, UID.ExplicitVRLittleEndian)) {
-                dos.writeDataset(null, dcmAttrs);
+            if (templateFile != null && templateFile.exists()) {
+                log.info("🧪 Usando template real para imagem {}: {}", i, templateFile.getName());
+                images.add(patchTemplate(templateFile, accessionNumber, patientName, patientID, studyInstanceUID, modality, i));
+            } else {
+                log.warn("⚠️ Nenhum template real encontrado em {}. Usando gerador sintético.", templatesPath);
+                images.add(generateSyntheticImage(accessionNumber, patientName, patientID, studyInstanceUID, modality, i));
             }
-            images.add(baos.toByteArray());
         }
 
         return images;
+    }
+
+    private File pickRandomTemplateFile() {
+        try {
+            File dir = new File(templatesPath);
+            if (!dir.exists() || !dir.isDirectory()) return null;
+            
+            File[] files = dir.listFiles(f -> f.isFile() && f.length() > 0);
+            if (files == null || files.length == 0) return null;
+            
+            return files[new Random().nextInt(files.length)];
+        } catch (Exception e) {
+            log.error("Erro ao listar templates: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private byte[] patchTemplate(File templateFile, String accessionNumber, String patientName, String patientID, String studyInstanceUID, String modality, int instanceNumber) throws IOException {
+        try (DicomInputStream dis = new DicomInputStream(templateFile)) {
+            Attributes dataset = dis.readDataset(-1, -1);
+            Attributes fmi = dis.getFileMetaInformation();
+
+            // Patch Patient Info
+            dataset.setString(Tag.PatientName, VR.PN, patientName);
+            dataset.setString(Tag.PatientID, VR.LO, patientID);
+            dataset.setString(Tag.AccessionNumber, VR.SH, accessionNumber);
+
+            // Patch Study/Series/SOP
+            dataset.setString(Tag.StudyInstanceUID, VR.UI, studyInstanceUID);
+            dataset.setString(Tag.SeriesInstanceUID, VR.UI, generateUID());
+            dataset.setString(Tag.SOPInstanceUID, VR.UI, generateUID());
+            dataset.setString(Tag.Modality, VR.CS, modality);
+            dataset.setInt(Tag.InstanceNumber, VR.IS, instanceNumber);
+
+            // Date/Time
+            String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
+            dataset.setString(Tag.InstanceCreationDate, VR.DA, now);
+            dataset.setString(Tag.InstanceCreationTime, VR.TM, nowTime);
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (DicomOutputStream dos = new DicomOutputStream(baos, UID.ExplicitVRLittleEndian)) {
+                dos.writeDataset(fmi, dataset);
+            }
+            return baos.toByteArray();
+        }
+    }
+
+    private byte[] generateSyntheticImage(String accessionNumber, String patientName, String patientID, String studyInstanceUID, String modality, int i) throws Exception {
+        Attributes dcmAttrs = new Attributes();
+
+        // Meta information
+        dcmAttrs.setString(Tag.PatientName, VR.PN, patientName);
+        dcmAttrs.setString(Tag.PatientID, VR.LO, patientID);
+        dcmAttrs.setString(Tag.AccessionNumber, VR.SH, accessionNumber);
+
+        // Study Information
+        dcmAttrs.setString(Tag.StudyInstanceUID, VR.UI, studyInstanceUID);
+        String seriesUID = generateUID();
+        String instanceUID = generateUID();
+
+        dcmAttrs.setString(Tag.SeriesInstanceUID, VR.UI, seriesUID);
+        dcmAttrs.setString(Tag.SOPInstanceUID, VR.UI, instanceUID);
+        dcmAttrs.setString(Tag.SOPClassUID, VR.UI, modality.equals("MR") ? UID.MRImageStorage : UID.UltrasoundImageStorage);
+
+        // Date and Time
+        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
+        dcmAttrs.setString(Tag.StudyDate, VR.DA, now);
+        dcmAttrs.setString(Tag.StudyTime, VR.TM, nowTime);
+        dcmAttrs.setString(Tag.ContentDate, VR.DA, now);
+        dcmAttrs.setString(Tag.ContentTime, VR.TM, nowTime);
+
+        // Modality
+        dcmAttrs.setString(Tag.Modality, VR.CS, modality);
+
+        // Series Number
+        dcmAttrs.setInt(Tag.SeriesNumber, VR.IS, 1);
+        dcmAttrs.setInt(Tag.InstanceNumber, VR.IS, i);
+
+        // Manufacturer and Device Info
+        dcmAttrs.setString(Tag.Manufacturer, VR.LO, "OmniLaudo Mock Modality");
+        dcmAttrs.setString(Tag.ManufacturerModelName, VR.LO, modality.equals("MR") ? "MockMR-Simulator-v1.0" : "MockUS-Simulator-v1.0");
+        dcmAttrs.setString(Tag.StationName, VR.SH, "MockModality-01");
+
+        // Image dimensions
+        dcmAttrs.setInt(Tag.SamplesPerPixel, VR.US, 1);
+        dcmAttrs.setInt(Tag.Rows, VR.US, 512);
+        dcmAttrs.setInt(Tag.Columns, VR.US, 512);
+        dcmAttrs.setInt(Tag.BitsAllocated, VR.US, 8);
+        dcmAttrs.setInt(Tag.BitsStored, VR.US, 8);
+        dcmAttrs.setInt(Tag.HighBit, VR.US, 7);
+        dcmAttrs.setString(Tag.PixelRepresentation, VR.US, "0");
+        dcmAttrs.setString(Tag.PhotometricInterpretation, VR.CS, "MONOCHROME2");
+
+        // Pixel data
+        byte[] pixelData = generateMockPixelData(512, 512, i);
+        dcmAttrs.setBytes(Tag.PixelData, VR.OB, pixelData);
+
+        // Serialize
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (DicomOutputStream dos = new DicomOutputStream(baos, UID.ExplicitVRLittleEndian)) {
+            dos.writeDataset(null, dcmAttrs);
+        }
+        return baos.toByteArray();
     }
     private DicomSendResponse sendDicomViaCStore(byte[] dicomData, String identifier) {
         try {
