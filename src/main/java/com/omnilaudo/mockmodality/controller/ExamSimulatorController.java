@@ -2,6 +2,8 @@ package com.omnilaudo.mockmodality.controller;
 
 import com.omnilaudo.mockmodality.dto.DicomSendResponse;
 import com.omnilaudo.mockmodality.dto.ExamSimulationRequest;
+import com.omnilaudo.mockmodality.dto.GenerateImagesRequest;
+import com.omnilaudo.mockmodality.dto.WorklistItemDTO;
 import com.omnilaudo.mockmodality.service.DicomGeneratorService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +32,18 @@ public class ExamSimulatorController {
         log.info("🎬 Iniciando simulação de modalidade...");
         List<DicomSendResponse> responses = dicomGeneratorService.simulateModality();
         return ResponseEntity.ok(responses);
+    }
+
+    @GetMapping("/worklist")
+    public ResponseEntity<List<WorklistItemDTO>> getWorklist() {
+        log.info("📋 GET /worklist - Consultando exames...");
+        return ResponseEntity.ok(dicomGeneratorService.getWorklist());
+    }
+
+    @PostMapping("/gerarImages")
+    public ResponseEntity<List<DicomSendResponse>> gerarImages(@RequestBody GenerateImagesRequest request) {
+        log.info("🎬 POST /gerarImages - Gerando imagens para Paciente={}", request.getPatientName());
+        return ResponseEntity.ok(dicomGeneratorService.generateAndSendImages(request));
     }
 
     @PostMapping(value = {"/api/v1/exams/upload", "/exams/upload"}, consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
