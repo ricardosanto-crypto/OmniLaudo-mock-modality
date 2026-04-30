@@ -22,6 +22,8 @@ import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import reactor.core.publisher.Mono;
+
 import java.io.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -100,30 +102,158 @@ public class DicomGeneratorService {
         String modality = request.getModality() != null ? request.getModality() : "US";
 
         try {
-            // Gerar 2 imagens conforme solicitado
-            List<byte[]> images = generateImages(request.getAccessionNumber(), 
-                                               request.getPatientName(), 
-                                               request.getPatientId(), 
-                                               request.getStudyInstanceUID(), 
-                                               modality, 
-                                               2);
-
-            for (int i = 0; i < images.size(); i++) {
-                DicomSendResponse response = sendDicomViaCStoreWithFallback(images.get(i), 
-                        request.getAccessionNumber() + "_img" + (i + 1));
-                responses.add(response);
+            String studyUID = request.getStudyInstanceUID();
+            if (studyUID == null || studyUID.isEmpty()) {
+                studyUID = generateUID();
             }
+            
+            // Gerar um SeriesInstanceUID único para que todas as 10 imagens fiquem na mesma série
+            String seriesUID = generateUID();
+            String sourcePath = "src/main/java/com/omnilaudo/mockmodality/dicom";
+            File dir = new File(sourcePath);
+            
+            log.info("📂 Lendo imagens do diretório: {}", sourcePath);
+            
+            File[] files = dir.listFiles((d, name) -> !name.startsWith(".") && name.toLowerCase().endsWith(".dcm"));
+            if (files == null || files.length == 0) {
+                // Tentar listar todos se não houver .dcm
+                files = dir.listFiles((d, name) -> !name.startsWith("."));
+            }
+
+            if (files == null || files.length == 0) {
+                throw new Exception("Nenhum arquivo encontrado em " + sourcePath);
+            }
+
+            log.info("📂 Encontrados {} arquivos no diretório", files.length);
+
+            // Pegar no máximo 50 arquivos
+            List<File> filesToProcess = Arrays.stream(files)
+                    .limit(50)
+                    .collect(Collectors.toList());
+
+            // Preparar todos os arquivos primeiro
+            List<byte[]> patchedImages = new ArrayList<>();
+            for (int i = 0; i < filesToProcess.size(); i++) {
+                patchedImages.add(patchDicomFile(filesToProcess.get(i), 
+                        request.getAccessionNumber(), 
+                        request.getPatientName(), 
+                        request.getPatientId(), 
+                        studyUID, 
+                        seriesUID,
+                        i + 1));
+            }
+
+            // Enviar todos em uma ÚNICA associação C-STORE
+            responses = sendMultipleDicomsViaCStore(patchedImages, request.getAccessionNumber());
+            
         } catch (Exception e) {
-            log.error("❌ Erro ao gerar/enviar imagens: {}", e.getMessage());
+            log.error("❌ Erro ao enviar imagens do diretório: {}", e.getMessage());
             responses.add(DicomSendResponse.builder()
                     .success(false)
                     .status("ERROR")
                     .message("Error: " + e.getMessage())
-                    .accessionNumber(request.getAccessionNumber())
-                    .timestamp(System.currentTimeMillis())
                     .build());
         }
         return responses;
+    }
+
+    private List<DicomSendResponse> sendMultipleDicomsViaCStore(List<byte[]> dicomImages, String accession) {
+        List<DicomSendResponse> responses = new ArrayList<>();
+        try {
+            Device device = new Device("mock-modality");
+            device.setExecutor(Executors.newCachedThreadPool());
+            device.setScheduledExecutor(Executors.newSingleThreadScheduledExecutor());
+
+            Connection conn = new Connection();
+            conn.setHostname(dicomHost);
+            conn.setPort(dicomPort);
+            device.addConnection(conn);
+
+            ApplicationEntity ae = new ApplicationEntity(modalityAET);
+            ae.addConnection(conn);
+            device.addApplicationEntity(ae);
+
+            AAssociateRQ rq = new AAssociateRQ();
+            rq.setCallingAET(modalityAET);
+            rq.setCalledAET(orthancAET);
+            
+            // Adicionar contextos de apresentação para as modalidades possíveis
+            rq.addPresentationContext(new PresentationContext(1, UID.UltrasoundImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(3, UID.MRImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(5, UID.SecondaryCaptureImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(7, UID.CTImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(11, UID.Verification, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+
+            Association as = ae.connect(conn, rq);
+            try {
+                for (int i = 0; i < dicomImages.size(); i++) {
+                    byte[] data = dicomImages.get(i);
+                    String id = accession + "_img" + (i + 1);
+                    
+                    try (DicomInputStream dis = new DicomInputStream(new ByteArrayInputStream(data))) {
+                        Attributes fmi = dis.getFileMetaInformation();
+                        Attributes dataset = dis.readDataset(-1, -1);
+                        
+                        String cuid = (fmi != null) ? fmi.getString(Tag.MediaStorageSOPClassUID) : dataset.getString(Tag.SOPClassUID);
+                        String iuid = (fmi != null) ? fmi.getString(Tag.MediaStorageSOPInstanceUID) : dataset.getString(Tag.SOPInstanceUID);
+                        
+                        DimseRSP rsp = as.cstore(cuid, iuid, 0, new DataWriterAdapter(dataset), null);
+                        rsp.next();
+                        
+                        int status = rsp.getCommand().getInt(Tag.Status, 0);
+                        if (status == 0) {
+                            responses.add(DicomSendResponse.builder().success(true).status("SUCCESS").accessionNumber(id).build());
+                        } else {
+                            log.warn("⚠️ Falha no envio da imagem {} (Status: {}H)", id, Integer.toHexString(status));
+                            responses.add(DicomSendResponse.builder().success(false).status("ERROR").message("Status: " + status).accessionNumber(id).build());
+                        }
+                    }
+                }
+            } finally {
+                as.release();
+            }
+        } catch (Exception e) {
+            log.error("❌ Erro na associação múltipla: {}", e.getMessage());
+            // Se falhar a associação, tenta o fallback individual via REST para cada imagem
+            for (int i = 0; i < dicomImages.size(); i++) {
+                responses.add(sendToOrthancRest(dicomImages.get(i), accession + "_img" + (i + 1)));
+            }
+        }
+        return responses;
+    }
+
+    /**
+     * Lê um arquivo DICOM existente e altera os metadados para vinculá-lo ao paciente/estudo atual.
+     */
+    private byte[] patchDicomFile(File file, String accession, String name, String patientId, String studyUID, String seriesUID, int instanceNumber) throws IOException {
+        try (DicomInputStream dis = new DicomInputStream(file)) {
+            Attributes dataset = dis.readDataset(-1, -1);
+            Attributes fmi = dis.getFileMetaInformation();
+            
+            dataset.setString(Tag.PatientName, VR.PN, name);
+            dataset.setString(Tag.PatientID, VR.LO, patientId);
+            dataset.setString(Tag.AccessionNumber, VR.SH, accession);
+            dataset.setString(Tag.StudyInstanceUID, VR.UI, studyUID);
+            dataset.setString(Tag.SeriesInstanceUID, VR.UI, seriesUID);
+            dataset.setString(Tag.SOPInstanceUID, VR.UI, generateUID()); // Novo SOP Instance para evitar duplicidade
+            dataset.setInt(Tag.InstanceNumber, VR.IS, instanceNumber);
+            
+            dataset.setString(Tag.InstitutionName, VR.LO, "OmniLaudo Hospital");
+            dataset.setString(Tag.StationName, VR.AE, "MOCK_MODALITY_STATION");
+            dataset.setString(Tag.Manufacturer, VR.LO, "OmniLaudo Mock Modality");
+            
+            // Manter a modalidade original ou usar do request
+            if (!dataset.contains(Tag.Modality)) {
+                dataset.setString(Tag.Modality, VR.CS, "US");
+            }
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (DicomOutputStream dos = new DicomOutputStream(baos, UID.ExplicitVRLittleEndian)) {
+                Attributes newFmi = dataset.createFileMetaInformation(UID.ExplicitVRLittleEndian);
+                dos.writeDataset(newFmi, dataset);
+            }
+            return baos.toByteArray();
+        }
     }
 
     private List<byte[]> generateImages(String accessionNumber, String patientName, String patientID, String studyInstanceUID, String modality, int count) throws Exception {
@@ -420,6 +550,8 @@ public class DicomGeneratorService {
         Attributes dcmAttrs = new Attributes();
         dcmAttrs.setString(Tag.PatientName, VR.PN, patientName);
         dcmAttrs.setString(Tag.PatientID, VR.LO, patientID);
+        dcmAttrs.setString(Tag.PatientSex, VR.CS, "O");
+        dcmAttrs.setString(Tag.PatientBirthDate, VR.DA, "20000101");
         dcmAttrs.setString(Tag.AccessionNumber, VR.SH, accessionNumber);
         dcmAttrs.setString(Tag.StudyInstanceUID, VR.UI, studyInstanceUID);
         dcmAttrs.setString(Tag.SeriesInstanceUID, VR.UI, generateUID());
@@ -430,23 +562,34 @@ public class DicomGeneratorService {
         String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
         dcmAttrs.setString(Tag.StudyDate, VR.DA, now);
         dcmAttrs.setString(Tag.StudyTime, VR.TM, nowTime);
+        dcmAttrs.setString(Tag.ContentDate, VR.DA, now);
+        dcmAttrs.setString(Tag.ContentTime, VR.TM, nowTime);
         dcmAttrs.setString(Tag.Modality, VR.CS, modality);
         dcmAttrs.setInt(Tag.SeriesNumber, VR.IS, 1);
         dcmAttrs.setInt(Tag.InstanceNumber, VR.IS, i);
+        dcmAttrs.setString(Tag.SpecificCharacterSet, VR.CS, "ISO_IR 100");
         dcmAttrs.setString(Tag.Manufacturer, VR.LO, "OmniLaudo Mock Modality");
+        dcmAttrs.setInt(Tag.SamplesPerPixel, VR.US, 1);
         dcmAttrs.setInt(Tag.Rows, VR.US, 512);
         dcmAttrs.setInt(Tag.Columns, VR.US, 512);
         dcmAttrs.setInt(Tag.BitsAllocated, VR.US, 8);
         dcmAttrs.setInt(Tag.BitsStored, VR.US, 8);
         dcmAttrs.setInt(Tag.HighBit, VR.US, 7);
+        dcmAttrs.setString(Tag.PixelRepresentation, VR.US, "0");
         dcmAttrs.setString(Tag.PhotometricInterpretation, VR.CS, "MONOCHROME2");
+        dcmAttrs.setString(Tag.WindowCenter, VR.DS, "128");
+        dcmAttrs.setString(Tag.WindowWidth, VR.DS, "256");
+        dcmAttrs.setString(Tag.RescaleIntercept, VR.DS, "0");
+        dcmAttrs.setString(Tag.RescaleSlope, VR.DS, "1");
+        dcmAttrs.setString(Tag.LossyImageCompression, VR.CS, "00");
 
         byte[] pixelData = generateMockPixelData(512, 512, i);
         dcmAttrs.setBytes(Tag.PixelData, VR.OB, pixelData);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DicomOutputStream dos = new DicomOutputStream(baos, UID.ExplicitVRLittleEndian)) {
-            dos.writeDataset(null, dcmAttrs);
+            Attributes fmi = dcmAttrs.createFileMetaInformation(UID.ExplicitVRLittleEndian);
+            dos.writeDataset(fmi, dcmAttrs);
         }
         return baos.toByteArray();
     }
@@ -469,8 +612,14 @@ public class DicomGeneratorService {
             AAssociateRQ rq = new AAssociateRQ();
             rq.setCallingAET(modalityAET);
             rq.setCalledAET(orthancAET);
-            rq.addPresentationContext(new PresentationContext(1, UID.UltrasoundImageStorage, UID.ImplicitVRLittleEndian));
-            rq.addPresentationContext(new PresentationContext(3, UID.MRImageStorage, UID.ImplicitVRLittleEndian));
+            
+            // Suporte para diversas modalidades (US, MR, SC, CT, etc) com Explicit e Implicit VR
+            rq.addPresentationContext(new PresentationContext(1, UID.UltrasoundImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(3, UID.MRImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(5, UID.SecondaryCaptureImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(7, UID.CTImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(9, UID.ComputedRadiographyImageStorage, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
+            rq.addPresentationContext(new PresentationContext(11, UID.Verification, UID.ExplicitVRLittleEndian, UID.ImplicitVRLittleEndian));
 
             Association as = ae.connect(conn, rq);
             try {
@@ -480,23 +629,51 @@ public class DicomGeneratorService {
                     fmi = dis.getFileMetaInformation();
                     dataset = dis.readDataset(-1, -1);
                 }
-                String cuid = fmi.getString(Tag.MediaStorageSOPClassUID);
-                String iuid = fmi.getString(Tag.MediaStorageSOPInstanceUID);
+                
+                // Usar SOPClassUID do dataset se FMI for nulo
+                String cuid = (fmi != null) ? fmi.getString(Tag.MediaStorageSOPClassUID) : dataset.getString(Tag.SOPClassUID);
+                String iuid = (fmi != null) ? fmi.getString(Tag.MediaStorageSOPInstanceUID) : dataset.getString(Tag.SOPInstanceUID);
+                
+                if (cuid == null || iuid == null) {
+                    throw new Exception("SOP Class UID ou SOP Instance UID ausentes no DICOM.");
+                }
+
                 DimseRSP rsp = as.cstore(cuid, iuid, 0, new DataWriterAdapter(dataset), null);
                 rsp.next();
+                
+                Attributes cmd = rsp.getCommand();
+                int status = cmd.getInt(Tag.Status, 0);
+                if (status != 0) {
+                    log.warn("⚠️ C-STORE rejeitado pelo servidor (Status: {}H). Tentando fallback...", Integer.toHexString(status));
+                    throw new Exception("C-STORE refused with status " + Integer.toHexString(status) + "H");
+                }
+
                 return DicomSendResponse.builder().success(true).status("SUCCESS").accessionNumber(identifier).build();
             } finally {
                 as.release();
             }
         } catch (Exception e) {
+            log.error("❌ Erro no C-STORE (ID: {}): {}", identifier, e.getMessage());
             return DicomSendResponse.builder().success(false).status("ERROR").message(e.getMessage()).accessionNumber(identifier).build();
         }
     }
 
     private DicomSendResponse sendDicomViaCStoreWithFallback(byte[] dicomData, String identifier) {
+        log.info("📤 Enviando imagem {}: {} bytes", identifier, dicomData.length);
         DicomSendResponse resp = sendDicomViaCStore(dicomData, identifier);
-        if (resp.isSuccess()) return resp;
-        return sendToOrthancRest(dicomData, identifier);
+        if (resp.isSuccess()) {
+            log.info("✅ Imagem {} enviada via C-STORE", identifier);
+            return resp;
+        }
+        
+        log.warn("⚠️ C-STORE falhou para {}, tentando REST fallback...", identifier);
+        DicomSendResponse restResp = sendToOrthancRest(dicomData, identifier);
+        if (restResp.isSuccess()) {
+            log.info("✅ Imagem {} enviada via REST fallback", identifier);
+        } else {
+            log.error("❌ Falha total ao enviar imagem {}: {}", identifier, restResp.getMessage());
+        }
+        return restResp;
     }
 
     private DicomSendResponse sendToOrthancRest(byte[] dicomData, String identifier) {
@@ -586,15 +763,26 @@ public class DicomGeneratorService {
 
     private String sendToOrthanc(byte[] dicomData, String accessionNumber) throws Exception {
         var webClient = webClientBuilder.build();
-        var requestSpec = webClient.post().uri(orthancUrl + "/instances");
+        var requestSpec = webClient.post()
+                .uri(orthancUrl + "/instances")
+                .header("Content-Type", "application/dicom");
         if (orthancUsername != null && !orthancUsername.isEmpty() && orthancPassword != null && !orthancPassword.isEmpty()) {
             requestSpec = requestSpec.headers(headers -> headers.setBasicAuth(orthancUsername, orthancPassword));
         }
-        var response = requestSpec.bodyValue(dicomData).retrieve().bodyToMono(Map.class).block();
-        if (response != null && response.containsKey("ID")) {
-            String instanceId = (String) response.get("ID");
-            String parentStudy = (String) response.get("ParentStudy");
+        var responseEntity = requestSpec.bodyValue(dicomData).retrieve()
+                .onStatus(status -> status.isError(), clientResponse -> {
+                    return clientResponse.bodyToMono(String.class).flatMap(body -> {
+                        log.error("❌ Erro detalhado do Orthanc (REST): {}", body);
+                        return Mono.error(new Exception("Orthanc error: " + body));
+                    });
+                })
+                .bodyToMono(Map.class).block();
+
+        if (responseEntity != null && responseEntity.containsKey("ID")) {
+            String instanceId = (String) responseEntity.get("ID");
+            String parentStudy = (String) responseEntity.get("ParentStudy");
             if (parentStudy != null) return parentStudy;
+            
             var studyRequestSpec = webClient.get().uri(orthancUrl + "/instances/" + instanceId);
             if (orthancUsername != null && !orthancUsername.isEmpty()) {
                 studyRequestSpec = studyRequestSpec.headers(headers -> headers.setBasicAuth(orthancUsername, orthancPassword));
